@@ -15,11 +15,14 @@ The C runtime is dependency-free (libc/libm/pthread only), with per-arch SIMD
 kernels (AVX2 on amd64, NEON on aarch64). This add-on is the **any-model**
 sibling of `nemo-asr-cpp` (ggml/GGUF, buffered).
 
-## Git / repo tracking
+## Repo structure
 
-**This add-on:** `stage: stable` — promoted 2026-06-18. The `nemotron-asr-c` scope
-is registered in allowed-scope tables, release-please config/manifest, labels,
-labeler, and issue templates.
+Standalone repo — source, CI, and releases live here.
+`ha-apps` references the published GHCR image via `image: ghcr.io/saya6k/app-nemotron-asr-c`.
+
+**Stage:** stable (no `stage:` key in `config.yaml`).
+
+Release flow: push to `main` → release-drafter drafts the next patch version → publish the draft → `build.yml` pushes multi-arch GHCR images → `repository_dispatch` to ha-apps auto-updates `config.yaml`.
 
 ## Architecture
 
