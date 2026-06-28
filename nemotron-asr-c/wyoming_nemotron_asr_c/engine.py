@@ -28,6 +28,42 @@ _LOGGER = logging.getLogger(__name__)
 # Strip the model's inline language-tag tokens (e.g. <ko-KR>, <en-US>).
 _TAG_RE = re.compile(r"\s*<[^>]*>\s*")
 
+
+def _cpu_has(feature: str) -> bool:
+    """Return True if the host CPU advertises *feature* in /proc/cpuinfo."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            return bool(re.search(r"\b" + re.escape(feature) + r"\b", f.read()))
+    except OSError:
+        return False
+
+
+def _pick_lib(lib_dir: str) -> str:
+    """Return the path to the best available libnemotron_asr variant.
+
+    Checks /proc/cpuinfo at startup and selects the highest-ISA build whose
+    feature requirements are met. Falls back to the generic baseline so the
+    service never SIGILLs regardless of host CPU or VM configuration.
+
+    Checked in priority order (highest ISA first):
+      libnemotron_asr_avx512.so  — x86-64 AVX-512F/BW/VL  (/proc: avx512f)
+      libnemotron_asr_avx2.so    — x86-64 AVX2+FMA         (/proc: avx2)
+      libnemotron_asr_sve.so     — aarch64 SVE              (/proc: sve)
+      libnemotron_asr_dotprod.so — aarch64 dotprod+fp16     (/proc: asimddp)
+      libnemotron_asr.so         — portable baseline        (always safe)
+    """
+    candidates = [
+        ("libnemotron_asr_avx512.so", "avx512f"),
+        ("libnemotron_asr_avx2.so", "avx2"),
+        ("libnemotron_asr_sve.so", "sve"),
+        ("libnemotron_asr_dotprod.so", "asimddp"),
+    ]
+    for filename, feature in candidates:
+        path = os.path.join(lib_dir, filename)
+        if os.path.exists(path) and _cpu_has(feature):
+            return path
+    return os.path.join(lib_dir, "libnemotron_asr.so")
+
 # ---- C callback signatures ----
 # int (*nemo_encoder_chunk_cb)(void *user, const float *enc, int enc_frames);
 _ENCODER_CHUNK_CB = CFUNCTYPE(c_int, c_void_p, POINTER(c_float), c_int)
@@ -198,7 +234,8 @@ class NemoCEngine:
             tokenizer_path: Path to SentencePiece tokenizer.model for hotword
                             tokenization. Extracted from the .nemo at boot.
         """
-        lib_path = os.path.join(lib_dir, "libnemotron_asr.so")
+        lib_path = _pick_lib(lib_dir)
+        _LOGGER.info("Loading C library: %s", os.path.basename(lib_path))
         self._lib = L = ctypes.CDLL(lib_path)
 
         # ---- Lifecycle ----
