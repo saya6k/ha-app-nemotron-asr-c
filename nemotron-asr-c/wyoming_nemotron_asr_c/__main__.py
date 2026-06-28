@@ -119,17 +119,29 @@ def _parse_args() -> argparse.Namespace:
         help="Enable the FastEnhancer denoise pre-filter on input audio",
     )
     parser.add_argument(
-        "--debug", action="store_true",
-        help="Enable debug logging",
+        "--log-level", default="info",
+        choices=["trace", "debug", "info", "notice", "warning", "error", "fatal"],
+        help="Log verbosity (HA log level names)",
     )
     return parser.parse_args()
+
+
+_LOG_LEVEL_MAP = {
+    "trace": logging.DEBUG,
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "notice": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+    "fatal": logging.CRITICAL,
+}
 
 
 async def main() -> None:
     args = _parse_args()
 
     logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
+        level=_LOG_LEVEL_MAP.get(args.log_level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
