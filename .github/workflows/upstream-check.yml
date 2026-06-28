@@ -1,0 +1,75 @@
+---
+name: Upstream check
+
+# yamllint disable-line rule:truthy
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    name: Check nemotron-asr-streaming.c + fastenhancer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get latest commits
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEM=$(gh api repos/kdrkdrkdr/nemotron-asr-streaming.c/commits/main --jq .sha)
+          FE=$(gh api repos/kdrkdrkdr/fastenhancer.c.wasm/commits/main --jq .sha)
+          echo "nemotron=$NEM" >> "$GITHUB_OUTPUT"
+          echo "fastenhancer=$FE" >> "$GITHUB_OUTPUT"
+          echo "nemotron-asr-streaming.c: $NEM"
+          echo "fastenhancer.c.wasm:      $FE"
+
+      - name: Open PR if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEM_LATEST: ${{ steps.upstream.outputs.nemotron }}
+          FE_LATEST: ${{ steps.upstream.outputs.fastenhancer }}
+        run: |
+          set -euo pipefail
+          NEM_CURRENT=$(grep '^ARG NEMOTRON_C_REF=' nemotron-asr-c/Dockerfile | cut -d= -f2)
+          FE_CURRENT=$(grep '^ARG FASTENHANCER_REF=' nemotron-asr-c/Dockerfile | cut -d= -f2)
+
+          [ "$NEM_LATEST" = "$NEM_CURRENT" ] && [ "$FE_LATEST" = "$FE_CURRENT" ] \
+            && echo "All up to date." && exit 0
+
+          BRANCH="upstream/nemotron-c-$(date +%Y%m%d)"
+          gh pr list --head "$BRANCH" --json number --jq 'length' \
+            | grep -qv '^0$' && echo "PR already open." && exit 0
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+
+          if [ "$NEM_LATEST" != "$NEM_CURRENT" ]; then
+            sed -i "s|^ARG NEMOTRON_C_REF=.*|ARG NEMOTRON_C_REF=${NEM_LATEST}|" nemotron-asr-c/Dockerfile
+          fi
+          if [ "$FE_LATEST" != "$FE_CURRENT" ]; then
+            sed -i "s|^ARG FASTENHANCER_REF=.*|ARG FASTENHANCER_REF=${FE_LATEST}|" nemotron-asr-c/Dockerfile
+          fi
+          git add nemotron-asr-c/Dockerfile
+          git commit -m "chore: bump upstream pins $(date +%Y-%m-%d)"
+          git push origin "$BRANCH"
+
+          BODY="## Upstream pin updates"
+          if [ "$NEM_LATEST" != "$NEM_CURRENT" ]; then
+            BODY+="$(printf '\n\nnemotron-asr-streaming.c: [%s...%s](https://github.com/kdrkdrkdr/nemotron-asr-streaming.c/compare/%s...%s)' "${NEM_CURRENT:0:12}" "${NEM_LATEST:0:12}" "${NEM_CURRENT:0:12}" "${NEM_LATEST:0:12}")"
+          fi
+          if [ "$FE_LATEST" != "$FE_CURRENT" ]; then
+            BODY+="$(printf '\n\nfastenhancer.c.wasm: [%s...%s](https://github.com/kdrkdrkdr/fastenhancer.c.wasm/compare/%s...%s)' "${FE_CURRENT:0:12}" "${FE_LATEST:0:12}" "${FE_CURRENT:0:12}" "${FE_LATEST:0:12}")"
+          fi
+          gh pr create \
+            --base main --head "$BRANCH" \
+            --title "chore: bump upstream pins $(date +%Y-%m-%d)" \
+            --body "$BODY" \
+            --assignee saya6k
