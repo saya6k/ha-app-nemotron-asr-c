@@ -38,13 +38,50 @@ COPY patches/ /tmp/patches/
 RUN git apply --stat /tmp/patches/*.patch \
     && git apply /tmp/patches/*.patch
 
-# Build shared library (position-independent, no CLI). SIMD kernels: NEON on
-# aarch64, AVX2/FMA on amd64, generic C fallback otherwise.
+# Build shared library (position-independent, no CLI).
+# Three builds per arch; Python picks the best at startup via /proc/cpuinfo.
+# All variants include -flto (upstream default) for cross-unit inlining.
+#
+#   aarch64 baseline  : armv8-a                        (NEON; Pi 4+, always safe)
+#   aarch64 dotprod   : armv8.2-a+dotprod+fp16         (Pi 5, Graviton2/3)
+#   aarch64 sve       : armv8.2-a+dotprod+fp16+sve     (Graviton3, Ampere Altra …)
+#
+#   x86_64  baseline  : x86-64     (SSE2; any x86-64)
+#   x86_64  avx2      : x86-64-v3  (AVX2+FMA; Haswell+)
+#   x86_64  avx512    : x86-64-v4  (AVX-512F/BW/VL; Skylake-X+, Ice Lake+)
+#
 # Drop into /usr/local/lib so the single COPY --from=builder /usr/local captures both
 # the .so and the Python packages in one layer.
-RUN make -j"$(nproc)" shared \
-    && strip --strip-unneeded libnemotron_asr.so \
-    && cp libnemotron_asr.so /usr/local/lib/
+RUN case "$(uname -m)" in \
+        aarch64) \
+            make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=armv8-a" \
+            && strip --strip-unneeded libnemotron_asr.so \
+            && cp libnemotron_asr.so /usr/local/lib/ \
+            && make clean \
+            && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=armv8.2-a+dotprod+fp16" \
+            && strip --strip-unneeded libnemotron_asr.so \
+            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_dotprod.so \
+            && make clean \
+            && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=armv8.2-a+dotprod+fp16+sve" \
+            && strip --strip-unneeded libnemotron_asr.so \
+            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_sve.so ;; \
+        x86_64) \
+            make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64" \
+            && strip --strip-unneeded libnemotron_asr.so \
+            && cp libnemotron_asr.so /usr/local/lib/ \
+            && make clean \
+            && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64-v3" \
+            && strip --strip-unneeded libnemotron_asr.so \
+            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_avx2.so \
+            && make clean \
+            && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64-v4" \
+            && strip --strip-unneeded libnemotron_asr.so \
+            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_avx512.so ;; \
+        *) \
+            make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto" \
+            && strip --strip-unneeded libnemotron_asr.so \
+            && cp libnemotron_asr.so /usr/local/lib/ ;; \
+    esac
 
 # ---- FastEnhancer: optional speech-enhancement pre-filter (denoise) ----
 # Vendored + pinned. Built natively WITHOUT -msimd128: every wasm_simd128 hot

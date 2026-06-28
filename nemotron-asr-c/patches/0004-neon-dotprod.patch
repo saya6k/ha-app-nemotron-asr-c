@@ -1,0 +1,62 @@
+NEON INT8 dot products: use vdotq_s32 (SDOT) when __ARM_FEATURE_DOTPROD.
+
+The baseline uses vmull_s8 + vpadalq_s16 (ARMv8.0-A, 2 instructions per
+16 input elements with an int16 intermediate). With the +dotprod extension
+(ARMv8.2-A asimddp flag, e.g. Pi 5 / Cortex-A76, Graviton2+), vdotq_s32
+processes all 16 INT8 elements in a single instruction — ~2× throughput on
+the q8p hot path at no cost to the ARMv8-A baseline build (Pi 4 / A72).
+
+Activated automatically when compiled with -march=...+dotprod, which sets
+__ARM_FEATURE_DOTPROD. Baseline (vmull+vpadalq) preserved via #else so the
+same source tree builds correctly for all ARMv8 targets.
+
+Note on I8MM (vmmlaq_s32, ARMv8.6-A): skipped here. The weight tiles are
+laid out as 4 × stride INT8 blocks (16 bytes per row per chunk) — a layout
+optimised for vdotq. Mapping that to the 2×8 × 8×2 operand shape required
+by smmla needs either an interleave pass on every load (cancelling the
+throughput gain) or a weight-storage reformat during .nemo → .bin
+conversion. Dotprod is the right fix for Pi 5; I8MM can be revisited if the
+storage format is ever reworked for MATMUL.
+
+--- nemotron_asr_kernels_neon.c
++++ nemotron_asr_kernels_neon.c
+@@ -211,8 +211,12 @@ static inline int32_t dot_i8p_neon_inline(const int8_t *x, const int8_t *w,
+     for (int k = 0; k < stride; k += 16, wr += 64) {
+         int8x16_t xv = vld1q_s8(x + k);
+         int8x16_t wv = vld1q_s8(wr);
++#ifdef __ARM_FEATURE_DOTPROD
++        acc = vdotq_s32(acc, xv, wv);
++#else
+         acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(xv), vget_low_s8(wv)));
+         acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(xv), vget_high_s8(wv)));
++#endif
+     }
+     return hsum_s32x4(acc);
+ }
+@@ -230,19 +234,26 @@ static inline void dot4_i8p_neon_inline(const int8_t *x, const int8_t *w,
+     for (int k = 0; k < stride; k += 16, blk += 64) {
+         int8x16_t xv = vld1q_s8(x + k);
++#ifdef __ARM_FEATURE_DOTPROD
++        a0 = vdotq_s32(a0, xv, vld1q_s8(blk));
++        a1 = vdotq_s32(a1, xv, vld1q_s8(blk + 16));
++        a2 = vdotq_s32(a2, xv, vld1q_s8(blk + 32));
++        a3 = vdotq_s32(a3, xv, vld1q_s8(blk + 48));
++#else
+         int8x8_t xlo = vget_low_s8(xv);
+         int8x8_t xhi = vget_high_s8(xv);
+         int8x16_t wv0 = vld1q_s8(blk);
+         int8x16_t wv1 = vld1q_s8(blk + 16);
+         int8x16_t wv2 = vld1q_s8(blk + 32);
+         int8x16_t wv3 = vld1q_s8(blk + 48);
+         a0 = vpadalq_s16(a0, vmull_s8(xlo, vget_low_s8(wv0)));
+         a0 = vpadalq_s16(a0, vmull_s8(xhi, vget_high_s8(wv0)));
+         a1 = vpadalq_s16(a1, vmull_s8(xlo, vget_low_s8(wv1)));
+         a1 = vpadalq_s16(a1, vmull_s8(xhi, vget_high_s8(wv1)));
+         a2 = vpadalq_s16(a2, vmull_s8(xlo, vget_low_s8(wv2)));
+         a2 = vpadalq_s16(a2, vmull_s8(xhi, vget_high_s8(wv2)));
+         a3 = vpadalq_s16(a3, vmull_s8(xlo, vget_low_s8(wv3)));
+         a3 = vpadalq_s16(a3, vmull_s8(xhi, vget_high_s8(wv3)));
++#endif
+     }
+     *s0_out = hsum_s32x4(a0);
+     *s1_out = hsum_s32x4(a1);
