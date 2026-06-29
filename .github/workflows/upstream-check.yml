@@ -23,8 +23,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          NEM=$(gh api repos/kdrkdrkdr/nemotron-asr-streaming.c/commits/main --jq .sha)
-          FE=$(gh api repos/kdrkdrkdr/fastenhancer.c.wasm/commits/main --jq .sha)
+          NEM=$(gh api repos/kdrkdrkdr/nemotron-asr-streaming.c/commits/HEAD --jq .sha)
+          FE=$(gh api repos/kdrkdrkdr/fastenhancer.c.wasm/commits/HEAD --jq .sha)
           echo "nemotron=$NEM" >> "$GITHUB_OUTPUT"
           echo "fastenhancer=$FE" >> "$GITHUB_OUTPUT"
           echo "nemotron-asr-streaming.c: $NEM"
