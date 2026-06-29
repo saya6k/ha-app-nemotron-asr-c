@@ -46,13 +46,20 @@ def _pick_lib(lib_dir: str) -> str:
     service never SIGILLs regardless of host CPU or VM configuration.
 
     Checked in priority order (highest ISA first):
+      libnemotron_asr_avxvnni.so — x86-64 AVX-VNNI (int8)    (/proc: avx_vnni)
       libnemotron_asr_avx512.so  — x86-64 AVX-512F/BW/VL  (/proc: avx512f)
       libnemotron_asr_avx2.so    — x86-64 AVX2+FMA         (/proc: avx2)
       libnemotron_asr_sve.so     — aarch64 SVE              (/proc: sve)
       libnemotron_asr_dotprod.so — aarch64 dotprod+fp16     (/proc: asimddp)
       libnemotron_asr.so         — portable baseline        (always safe)
+
+    AVX-VNNI is checked before AVX-512 because the int8 hot path gains from
+    vpdpbusd, which the avx512 build does not enable; CPUs with both (e.g.
+    Sapphire Rapids) still get the VNNI kernel, while AVX-512-only parts
+    (Skylake-X) fall through to the avx512 build.
     """
     candidates = [
+        ("libnemotron_asr_avxvnni.so", "avx_vnni"),
         ("libnemotron_asr_avx512.so", "avx512f"),
         ("libnemotron_asr_avx2.so", "avx2"),
         ("libnemotron_asr_sve.so", "sve"),

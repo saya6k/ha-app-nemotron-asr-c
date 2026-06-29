@@ -48,6 +48,7 @@ RUN git apply --stat /tmp/patches/*.patch \
 #
 #   x86_64  baseline  : x86-64     (SSE2; any x86-64)
 #   x86_64  avx2      : x86-64-v3  (AVX2+FMA; Haswell+)
+#   x86_64  avxvnni   : x86-64-v3 +avxvnni (int8 vpdpbusd; Alder Lake / -N, N100+)
 #   x86_64  avx512    : x86-64-v4  (AVX-512F/BW/VL; Skylake-X+, Ice Lake+)
 #
 # Drop into /usr/local/lib so the single COPY --from=builder /usr/local captures both
@@ -73,6 +74,10 @@ RUN case "$(uname -m)" in \
             && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64-v3" \
             && strip --strip-unneeded libnemotron_asr.so \
             && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_avx2.so \
+            && make clean \
+            && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64-v3 -mavxvnni" \
+            && strip --strip-unneeded libnemotron_asr.so \
+            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_avxvnni.so \
             && make clean \
             && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64-v4" \
             && strip --strip-unneeded libnemotron_asr.so \

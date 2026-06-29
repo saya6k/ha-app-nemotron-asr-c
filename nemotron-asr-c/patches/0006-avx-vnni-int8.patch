@@ -1,0 +1,120 @@
+AVX-VNNI int8 hot path (x86 counterpart of 0004-neon-dotprod).
+
+Upstream's x86 Q8P matvec/argmax widens int8->int16 and uses vpmaddwd ("no
+VNNI" per the avx.c banner). On AVX-VNNI (Alder Lake / Alder Lake-N N-series and
+newer low-power E-cores) and AVX512-VNNI, vpdpbusd does the int8 dot-accumulate
+in one instruction. This adds a VNNI path to the 4-row tile kernel (dot4), the
+throughput-dominant case; the single-row remainder keeps the madd path.
+
+vpdpbusd is u8*s8 but Q8P is s8*s8, so the weights are biased to unsigned
+(w ^ 0x80) and the +128 bias is removed with -128*sum_x per row (sum_x computed
+once per matvec). The result is integer-exact versus the madd fallback. Guarded
+by __AVXVNNI__ (VEX _mm256_dpbusd_avx_epi32) / __AVX512VNNI__+__AVX512VL__ (EVEX
+_mm256_dpbusd_epi32); without either it compiles to the original int16 path.
+
+--- nemotron_asr_kernels_avx.c
++++ nemotron_asr_kernels_avx.c
+@@ -33,6 +33,26 @@ static inline int32_t hsum_m256i_epi32(__m256i v) {
+     return _mm_cvtsi128_si32(sum);
+ }
+ 
++static inline int32_t hsum_m128i_epi32(__m128i v) __attribute__((unused));
++static inline int32_t hsum_m128i_epi32(__m128i v) {
++    v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
++    v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
++    return _mm_cvtsi128_si32(v);
++}
++
++/* AVX-VNNI (Alder Lake / Alder Lake-N and newer low-power E-cores) and
++ * AVX512-VNNI expose vpdpbusd: a single-instruction u8*s8 -> i32 dot-accumulate.
++ * The Q8P matvec is signed*signed, so the weights are biased to unsigned
++ * (w ^ 0x80 == w + 128) and the +128 bias is undone with -128*sum_x per row.
++ * Integer-exact versus the int16 widening + madd fallback. */
++#if defined(__AVXVNNI__)
++#define NEMO_AVX_DPBUSD(acc, u, s) _mm256_dpbusd_avx_epi32((acc), (u), (s))
++#define NEMO_AVX_HAVE_VNNI 1
++#elif defined(__AVX512VNNI__) && defined(__AVX512VL__)
++#define NEMO_AVX_DPBUSD(acc, u, s) _mm256_dpbusd_epi32((acc), (u), (s))
++#define NEMO_AVX_HAVE_VNNI 1
++#endif
++
+ static inline float dot_f32_avx_inline(const float *a, const float *b, int n) {
+     int i = 0;
+     __m256 acc0 = _mm256_setzero_ps();
+@@ -74,11 +94,33 @@ static inline int32_t dot_i8p_avx_inline(const int8_t *x, const int8_t *w,
+ }
+ 
+ static inline void dot4_i8p_avx_inline(const int8_t *x, const int8_t *w,
+-                                       int row, int stride,
++                                       int row, int stride, int32_t sum_x,
+                                        int32_t *s0_out, int32_t *s1_out,
+                                        int32_t *s2_out, int32_t *s3_out) {
+     const int tile = row >> 2;
+     const int8_t *blk = w + (size_t)tile * 4u * (size_t)stride;
++#ifdef NEMO_AVX_HAVE_VNNI
++    /* The 4-row tile stores row0|row1 in the first 32 bytes and row2|row3 in
++     * the next 32, so each 256-bit weight load already holds two rows. The 16
++     * shared activations are broadcast into both 128-bit halves, so one
++     * vpdpbusd covers two rows at once. */
++    const __m256i bias = _mm256_set1_epi8((char)0x80);
++    __m256i acc01 = _mm256_setzero_si256();
++    __m256i acc23 = _mm256_setzero_si256();
++    for (int k = 0; k < stride; k += 16, blk += 64) {
++        __m256i xd = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(x + k)));
++        __m256i w01 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)blk), bias);
++        __m256i w23 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)(blk + 32)), bias);
++        acc01 = NEMO_AVX_DPBUSD(acc01, w01, xd);
++        acc23 = NEMO_AVX_DPBUSD(acc23, w23, xd);
++    }
++    const int32_t corr = 128 * sum_x;
++    *s0_out = hsum_m128i_epi32(_mm256_castsi256_si128(acc01)) - corr;
++    *s1_out = hsum_m128i_epi32(_mm256_extracti128_si256(acc01, 1)) - corr;
++    *s2_out = hsum_m128i_epi32(_mm256_castsi256_si128(acc23)) - corr;
++    *s3_out = hsum_m128i_epi32(_mm256_extracti128_si256(acc23, 1)) - corr;
++#else
++    (void)sum_x;
+     __m256i a0 = _mm256_setzero_si256();
+     __m256i a1 = _mm256_setzero_si256();
+     __m256i a2 = _mm256_setzero_si256();
+@@ -98,11 +140,14 @@ static inline void dot4_i8p_avx_inline(const int8_t *x, const int8_t *w,
+     *s1_out = hsum_m256i_epi32(a1);
+     *s2_out = hsum_m256i_epi32(a2);
+     *s3_out = hsum_m256i_epi32(a3);
++#endif
+ }
+ 
+ void nemo_q8p_matvec_fused_avx(float *y, const int8_t *x_q8, float x_scale,
+                                const int8_t *w, const float *w_scales,
+                                const float *b, int stride, int start, int out_dim) {
++    int32_t sum_x = 0;
++    for (int sk = 0; sk < stride; sk++) sum_x += x_q8[sk];
+     int i = 0;
+     int o = start;
+     for (; i < out_dim && (o & 3); i++, o++) {
+@@ -111,7 +156,7 @@ void nemo_q8p_matvec_fused_avx(float *y, const int8_t *x_q8, float x_scale,
+     }
+     for (; i + 3 < out_dim; i += 4, o += 4) {
+         int32_t s0, s1, s2, s3;
+-        dot4_i8p_avx_inline(x_q8, w, o, stride, &s0, &s1, &s2, &s3);
++        dot4_i8p_avx_inline(x_q8, w, o, stride, sum_x, &s0, &s1, &s2, &s3);
+         y[i] = (float)s0 * x_scale * w_scales[o] + (b ? b[i] : 0.0f);
+         y[i + 1] = (float)s1 * x_scale * w_scales[o + 1] + (b ? b[i + 1] : 0.0f);
+         y[i + 2] = (float)s2 * x_scale * w_scales[o + 2] + (b ? b[i + 2] : 0.0f);
+@@ -127,6 +172,8 @@ int nemo_argmax_q8p_range_avx(const int8_t *x_q8, float x_scale,
+                               const int8_t *w, const float *w_scales,
+                               const float *b, int stride, int start, int end,
+                               float *best_val_out) {
++    int32_t sum_x = 0;
++    for (int sk = 0; sk < stride; sk++) sum_x += x_q8[sk];
+     int best = start;
+     float best_val = -3.4028234663852886e38f;
+     int o = start;
+@@ -140,7 +187,7 @@ int nemo_argmax_q8p_range_avx(const int8_t *x_q8, float x_scale,
+     }
+     for (; o + 3 < end; o += 4) {
+         int32_t s0, s1, s2, s3;
+-        dot4_i8p_avx_inline(x_q8, w, o, stride, &s0, &s1, &s2, &s3);
++        dot4_i8p_avx_inline(x_q8, w, o, stride, sum_x, &s0, &s1, &s2, &s3);
+         float v0 = (float)s0 * x_scale * w_scales[o] + (b ? b[o] : 0.0f);
+         float v1 = (float)s1 * x_scale * w_scales[o + 1] + (b ? b[o + 1] : 0.0f);
+         float v2 = (float)s2 * x_scale * w_scales[o + 2] + (b ? b[o + 2] : 0.0f);
