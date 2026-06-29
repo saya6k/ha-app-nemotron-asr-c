@@ -1,0 +1,128 @@
+Restore the f32 reference weight path.
+
+Upstream @ 568ef79 made the runtime W8A8 Q8P-only and removed the f32-dense weight
+machinery. The add-on keeps f32 as an optional full-precision reference quant, so
+this re-adds a generic (single-threaded, accuracy-reference) f32 arm to each
+weight dispatcher in nemotron_asr_kernels.c, the f32 pointer in nemo_weight_t
+(nemotron_asr_kernels.h), and the F32 bind in the model loader
+(nemotron_asr_model.c). bf16 is not restored.
+--- nemotron_asr_kernels.c
++++ nemotron_asr_kernels.c
+@@ -605,8 +605,26 @@ double nemo_time_ms(void) {
+ #endif
+ }
+ 
++/* ---- f32 reference weight path (NEMO_TENSOR_F32) ----
++ * Restored after upstream went W8A8 Q8P-only; the add-on keeps f32 as an
++ * optional full-precision reference quant. Generic and single-threaded
++ * (accuracy reference, not a throughput path); uses the SIMD nemo_dot_f32. */
++static void nemo_f32_linear_ref(float *y, const float *x, const float *w,
++                                const float *b, int rows, int in_dim, int out_dim) {
++    for (int r = 0; r < rows; r++) {
++        const float *xr = x + (size_t)r * in_dim;
++        float *yr = y + (size_t)r * out_dim;
++        for (int o = 0; o < out_dim; o++)
++            yr[o] = nemo_dot_f32(xr, w + (size_t)o * in_dim, in_dim) + (b ? b[o] : 0.0f);
++    }
++}
++
+ void nemo_linear_weight(float *y, const float *x, const nemo_weight_t *w, const float *b,
+                         int rows, int in_dim, int out_dim) {
++    if (w->dtype == NEMO_TENSOR_F32) {
++        nemo_f32_linear_ref(y, x, w->f32, b, rows, in_dim, out_dim);
++        return;
++    }
+     long long work = (long long)rows * (long long)in_dim * (long long)out_dim;
+     nemo_linear_weight_task_t task = {y, x, w, b, rows, in_dim, out_dim};
+     if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
+@@ -643,6 +661,13 @@ void nemo_linear3_nobias_weight(float *y0, float *y1, float *y2, const float *x,
+                                 const nemo_weight_t *w0, const nemo_weight_t *w1,
+                                 const nemo_weight_t *w2,
+                                 int rows, int in_dim, int out_dim) {
++    if (w0->dtype == NEMO_TENSOR_F32 || w1->dtype == NEMO_TENSOR_F32 ||
++        w2->dtype == NEMO_TENSOR_F32) {
++        nemo_linear_nobias_weight(y0, x, w0, rows, in_dim, out_dim);
++        nemo_linear_nobias_weight(y1, x, w1, rows, in_dim, out_dim);
++        nemo_linear_nobias_weight(y2, x, w2, rows, in_dim, out_dim);
++        return;
++    }
+     long long work = (long long)rows * (long long)in_dim * (long long)out_dim * 3LL;
+     nemo_linear3_weight_task_t task = {y0, y1, y2, x, w0, w1, w2, rows, in_dim, out_dim};
+     if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
+@@ -681,6 +706,19 @@ void nemo_prompt_linear_relu_weight(float *y, const float *x, const nemo_weight_
+                                     const float *b, int rows, int in_dim,
+                                     int prompt_dim, int prompt_id, int out_dim) {
+     if (prompt_id < 0 || prompt_id >= prompt_dim) prompt_id = prompt_dim - 1;
++    if (w->dtype == NEMO_TENSOR_F32) {
++        int stride = in_dim + prompt_dim;
++        for (int r = 0; r < rows; r++) {
++            const float *xr = x + (size_t)r * in_dim;
++            for (int o = 0; o < out_dim; o++) {
++                const float *wr = w->f32 + (size_t)o * stride;
++                float v = (b ? b[o] : 0.0f) + wr[in_dim + prompt_id];
++                v += nemo_dot_f32(xr, wr, in_dim);
++                y[(size_t)r * out_dim + o] = v > 0.0f ? v : 0.0f;
++            }
++        }
++        return;
++    }
+     long long work = (long long)rows * (long long)in_dim * (long long)out_dim;
+     nemo_prompt_q8_task_t task = {y, x, w, b, rows, in_dim, prompt_dim, prompt_id, out_dim};
+     if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
+@@ -694,6 +732,15 @@ void nemo_lstm_gates_weight(float *y, const float *x, const float *h,
+                             const nemo_weight_t *w_ih, const nemo_weight_t *w_hh,
+                             const float *b_ih, const float *b_hh,
+                             int dim, int out_dim) {
++    if (w_ih->dtype == NEMO_TENSOR_F32 || w_hh->dtype == NEMO_TENSOR_F32) {
++        for (int o = 0; o < out_dim; o++) {
++            float v = (b_ih ? b_ih[o] : 0.0f) + (b_hh ? b_hh[o] : 0.0f);
++            v += nemo_dot_f32(x, w_ih->f32 + (size_t)o * dim, dim);
++            v += nemo_dot_f32(h, w_hh->f32 + (size_t)o * dim, dim);
++            y[o] = v;
++        }
++        return;
++    }
+     long long work = (long long)dim * (long long)out_dim * 2LL;
+     nemo_lstm_gates_q8_task_t task = {y, x, h, w_ih, w_hh, b_ih, b_hh, dim, out_dim};
+     if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
+@@ -722,6 +769,17 @@ float nemo_attention_score_f32(const float *q, const float *bias_u, const float
+ 
+ int nemo_argmax_matvec_weight(const float *x, const nemo_weight_t *w, const float *b,
+                               int in_dim, int out_dim, float *best_val_out) {
++    if (w->dtype == NEMO_TENSOR_F32) {
++        int best = 0;
++        float best_val = -3.4028234663852886e38f;
++        for (int o = 0; o < out_dim; o++) {
++            float v = (b ? b[o] : 0.0f) +
++                      nemo_dot_f32(x, w->f32 + (size_t)o * in_dim, in_dim);
++            if (v > best_val) { best_val = v; best = o; }
++        }
++        if (best_val_out) *best_val_out = best_val;
++        return best;
++    }
+     long long work = (long long)in_dim * (long long)out_dim;
+     int parallel = g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN;
+     nemo_argmax_weight_task_t task;
+--- nemotron_asr_kernels.h
++++ nemotron_asr_kernels.h
+@@ -12,6 +12,7 @@
+ #define NEMO_TENSOR_Q8P  4u
+ 
+ typedef struct {
++    const float *f32;
+     const int8_t *q8;
+     const float *q8_scales;
+     uint32_t q8_stride;
+--- nemotron_asr_model.c
++++ nemotron_asr_model.c
+@@ -98,6 +98,10 @@ static int bind_weight(const nemo_model_t *m, const char *name, nemo_weight_t *d
+     }
+     memset(dst, 0, sizeof(*dst));
+     dst->dtype = t->dtype;
++    if (t->dtype == NEMO_TENSOR_F32 && t->data) {
++        dst->f32 = t->data;
++        return 0;
++    }
+     if (t->dtype == NEMO_TENSOR_Q8P && t->data_q8 && t->q8_scales) {
+         dst->q8 = t->data_q8;
+         dst->q8_scales = t->q8_scales;

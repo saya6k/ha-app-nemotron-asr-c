@@ -280,8 +280,9 @@ class NemoCEngine:
         L.nemo_rnnt_stream_free.argtypes = [c_void_p]
 
         # ---- Threads ----
+        # Upstream (@ 568ef79) defaults to a single worker and dropped
+        # nemo_get_threads; callers opt into parallelism via nemo_set_threads.
         L.nemo_set_threads.argtypes = [c_int]
-        L.nemo_get_threads.restype = c_int
 
         # ---- Streaming lookahead ----
         L.nemo_set_att_right.argtypes = [c_void_p, c_int]
@@ -324,8 +325,8 @@ class NemoCEngine:
                 )
 
         _LOGGER.info(
-            "Engine ready: %s loaded (att_right=%d, threads=%d)",
-            bin_path, att_right, L.nemo_get_threads(),
+            "Engine ready: %s loaded (att_right=%d)",
+            bin_path, att_right,
         )
 
     def _set_att_right(self, value: int) -> None:
