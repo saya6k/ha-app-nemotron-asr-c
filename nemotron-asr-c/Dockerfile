@@ -39,16 +39,18 @@ RUN git apply --stat /tmp/patches/*.patch \
     && git apply /tmp/patches/*.patch
 
 # Build shared library (position-independent, no CLI).
-# Three builds per arch; Python picks the best at startup via /proc/cpuinfo.
-# All variants include -flto (upstream default) for cross-unit inlining.
+# One build per distinct hand-tuned kernel; Python picks the best at startup via
+# /proc/cpuinfo. All variants include -flto (upstream default) for cross-unit
+# inlining. Only ISAs with a dedicated kernel get a variant: sve and avx-512 had
+# no kernel of their own (the hot path is NEON/dotprod and AVX2/VNNI), so those
+# CPUs fall back to dotprod / avx2 with no loss.
 #
 #   aarch64 baseline  : armv8-a                        (NEON; Pi 4+, always safe)
-#   aarch64 dotprod   : armv8.2-a+dotprod+fp16         (Pi 5, Graviton2/3)
-#   aarch64 sve       : armv8.2-a+dotprod+fp16+sve     (Graviton3, Ampere Altra …)
+#   aarch64 dotprod   : armv8.2-a+dotprod+fp16         (SDOT int8; Pi 5, Graviton2/3)
 #
 #   x86_64  baseline  : x86-64     (SSE2; any x86-64)
 #   x86_64  avx2      : x86-64-v3  (AVX2+FMA; Haswell+)
-#   x86_64  avx512    : x86-64-v4  (AVX-512F/BW/VL; Skylake-X+, Ice Lake+)
+#   x86_64  avxvnni   : x86-64-v3 +avxvnni (int8 vpdpbusd; Alder Lake / -N, N100+)
 #
 # Drop into /usr/local/lib so the single COPY --from=builder /usr/local captures both
 # the .so and the Python packages in one layer.
@@ -60,11 +62,7 @@ RUN case "$(uname -m)" in \
             && make clean \
             && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=armv8.2-a+dotprod+fp16" \
             && strip --strip-unneeded libnemotron_asr.so \
-            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_dotprod.so \
-            && make clean \
-            && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=armv8.2-a+dotprod+fp16+sve" \
-            && strip --strip-unneeded libnemotron_asr.so \
-            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_sve.so ;; \
+            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_dotprod.so ;; \
         x86_64) \
             make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64" \
             && strip --strip-unneeded libnemotron_asr.so \
@@ -74,9 +72,9 @@ RUN case "$(uname -m)" in \
             && strip --strip-unneeded libnemotron_asr.so \
             && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_avx2.so \
             && make clean \
-            && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64-v4" \
+            && make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto -march=x86-64-v3 -mavxvnni" \
             && strip --strip-unneeded libnemotron_asr.so \
-            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_avx512.so ;; \
+            && cp libnemotron_asr.so /usr/local/lib/libnemotron_asr_avxvnni.so ;; \
         *) \
             make -j"$(nproc)" shared CFLAGS="-O3 -ffast-math -flto" \
             && strip --strip-unneeded libnemotron_asr.so \

@@ -46,16 +46,19 @@ def _pick_lib(lib_dir: str) -> str:
     service never SIGILLs regardless of host CPU or VM configuration.
 
     Checked in priority order (highest ISA first):
-      libnemotron_asr_avx512.so  — x86-64 AVX-512F/BW/VL  (/proc: avx512f)
+      libnemotron_asr_avxvnni.so — x86-64 AVX-VNNI (int8)    (/proc: avx_vnni)
       libnemotron_asr_avx2.so    — x86-64 AVX2+FMA         (/proc: avx2)
-      libnemotron_asr_sve.so     — aarch64 SVE              (/proc: sve)
       libnemotron_asr_dotprod.so — aarch64 dotprod+fp16     (/proc: asimddp)
       libnemotron_asr.so         — portable baseline        (always safe)
+
+    Only ISAs with a dedicated kernel get a build: AVX-VNNI (int8 vpdpbusd) and
+    NEON dotprod (SDOT), plus the AVX2 / NEON baselines. SVE and AVX-512 have no
+    kernel of their own, so those CPUs fall through to dotprod / avx2 with no
+    loss.
     """
     candidates = [
-        ("libnemotron_asr_avx512.so", "avx512f"),
+        ("libnemotron_asr_avxvnni.so", "avx_vnni"),
         ("libnemotron_asr_avx2.so", "avx2"),
-        ("libnemotron_asr_sve.so", "sve"),
         ("libnemotron_asr_dotprod.so", "asimddp"),
     ]
     for filename, feature in candidates:
