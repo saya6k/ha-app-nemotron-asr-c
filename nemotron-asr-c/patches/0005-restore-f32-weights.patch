@@ -1,29 +1,135 @@
-Restore the f32 reference weight path.
+Restore the f32 reference weight path (thread-pool parallel).
 
 Upstream @ 568ef79 made the runtime W8A8 Q8P-only and removed the f32-dense weight
-machinery. The add-on keeps f32 as an optional full-precision reference quant, so
-this re-adds a generic (single-threaded, accuracy-reference) f32 arm to each
-weight dispatcher in nemotron_asr_kernels.c, the f32 pointer in nemo_weight_t
-(nemotron_asr_kernels.h), and the F32 bind in the model loader
-(nemotron_asr_model.c). bf16 is not restored.
+machinery. The add-on keeps f32 as an optional full-precision quant, so this
+re-adds an f32 arm to each weight dispatcher in nemotron_asr_kernels.c, the f32
+pointer in nemo_weight_t (nemotron_asr_kernels.h), and the F32 bind in the model
+loader (nemotron_asr_model.c). The dense matvec is memory-bandwidth bound, so the
+f32 arms run on the existing thread pool (output-dim split, no shared writes;
+inner product is SIMD via nemo_dot_f32) rather than via wider vectors. bf16 is
+not restored.
+
 --- nemotron_asr_kernels.c
 +++ nemotron_asr_kernels.c
-@@ -605,8 +605,26 @@ double nemo_time_ms(void) {
+@@ -605,8 +605,129 @@ double nemo_time_ms(void) {
  #endif
  }
  
 +/* ---- f32 reference weight path (NEMO_TENSOR_F32) ----
 + * Restored after upstream went W8A8 Q8P-only; the add-on keeps f32 as an
-+ * optional full-precision reference quant. Generic and single-threaded
-+ * (accuracy reference, not a throughput path); uses the SIMD nemo_dot_f32. */
++ * optional full-precision reference quant. The dense matvec is memory-bandwidth
++ * bound (4 B/weight), so the speedup comes from the thread pool, not wider
++ * vectors: workers split the output dimension into disjoint row ranges (no
++ * shared writes) and the inner product is already SIMD via nemo_dot_f32. */
++typedef struct {
++    float *y;
++    const float *x;
++    const float *w;
++    const float *b;
++    int rows;
++    int in_dim;
++    int out_dim;
++} nemo_f32_linear_task_t;
++
++static void nemo_f32_linear_worker(int tid, int n_threads, void *arg) {
++    nemo_f32_linear_task_t *t = (nemo_f32_linear_task_t *)arg;
++    int start = (t->out_dim * tid) / n_threads;
++    int end = (t->out_dim * (tid + 1)) / n_threads;
++    for (int r = 0; r < t->rows; r++) {
++        const float *xr = t->x + (size_t)r * t->in_dim;
++        float *yr = t->y + (size_t)r * t->out_dim;
++        for (int o = start; o < end; o++)
++            yr[o] = nemo_dot_f32(xr, t->w + (size_t)o * t->in_dim, t->in_dim)
++                    + (t->b ? t->b[o] : 0.0f);
++    }
++}
++
 +static void nemo_f32_linear_ref(float *y, const float *x, const float *w,
 +                                const float *b, int rows, int in_dim, int out_dim) {
-+    for (int r = 0; r < rows; r++) {
-+        const float *xr = x + (size_t)r * in_dim;
-+        float *yr = y + (size_t)r * out_dim;
-+        for (int o = 0; o < out_dim; o++)
-+            yr[o] = nemo_dot_f32(xr, w + (size_t)o * in_dim, in_dim) + (b ? b[o] : 0.0f);
++    nemo_f32_linear_task_t task = {y, x, w, b, rows, in_dim, out_dim};
++    long long work = (long long)rows * (long long)in_dim * (long long)out_dim;
++    if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
++        nemo_parallel_for(nemo_f32_linear_worker, &task);
++    } else {
++        nemo_f32_linear_worker(0, 1, &task);
 +    }
++}
++
++typedef struct {
++    float *y;
++    const float *x;
++    const float *w;
++    const float *b;
++    int rows;
++    int in_dim;
++    int prompt_dim;
++    int prompt_id;
++    int out_dim;
++} nemo_f32_prompt_task_t;
++
++static void nemo_f32_prompt_worker(int tid, int n_threads, void *arg) {
++    nemo_f32_prompt_task_t *t = (nemo_f32_prompt_task_t *)arg;
++    int stride = t->in_dim + t->prompt_dim;
++    int start = (t->out_dim * tid) / n_threads;
++    int end = (t->out_dim * (tid + 1)) / n_threads;
++    for (int r = 0; r < t->rows; r++) {
++        const float *xr = t->x + (size_t)r * t->in_dim;
++        for (int o = start; o < end; o++) {
++            const float *wr = t->w + (size_t)o * stride;
++            float v = (t->b ? t->b[o] : 0.0f) + wr[t->in_dim + t->prompt_id];
++            v += nemo_dot_f32(xr, wr, t->in_dim);
++            t->y[(size_t)r * t->out_dim + o] = v > 0.0f ? v : 0.0f;
++        }
++    }
++}
++
++typedef struct {
++    float *y;
++    const float *x;
++    const float *h;
++    const float *w_ih;
++    const float *w_hh;
++    const float *b_ih;
++    const float *b_hh;
++    int dim;
++    int out_dim;
++} nemo_f32_lstm_task_t;
++
++static void nemo_f32_lstm_worker(int tid, int n_threads, void *arg) {
++    nemo_f32_lstm_task_t *t = (nemo_f32_lstm_task_t *)arg;
++    int start = (t->out_dim * tid) / n_threads;
++    int end = (t->out_dim * (tid + 1)) / n_threads;
++    for (int o = start; o < end; o++) {
++        float v = (t->b_ih ? t->b_ih[o] : 0.0f) + (t->b_hh ? t->b_hh[o] : 0.0f);
++        v += nemo_dot_f32(t->x, t->w_ih + (size_t)o * t->dim, t->dim);
++        v += nemo_dot_f32(t->h, t->w_hh + (size_t)o * t->dim, t->dim);
++        t->y[o] = v;
++    }
++}
++
++typedef struct {
++    const float *x;
++    const float *w;
++    const float *b;
++    int in_dim;
++    int out_dim;
++    int best[NEMO_MAX_THREADS];
++    float best_val[NEMO_MAX_THREADS];
++} nemo_f32_argmax_task_t;
++
++static void nemo_f32_argmax_worker(int tid, int n_threads, void *arg) {
++    nemo_f32_argmax_task_t *t = (nemo_f32_argmax_task_t *)arg;
++    int start = (t->out_dim * tid) / n_threads;
++    int end = (t->out_dim * (tid + 1)) / n_threads;
++    int best = start;
++    float best_val = -3.4028234663852886e38f;
++    for (int o = start; o < end; o++) {
++        float v = (t->b ? t->b[o] : 0.0f) +
++                  nemo_dot_f32(t->x, t->w + (size_t)o * t->in_dim, t->in_dim);
++        if (v > best_val) { best_val = v; best = o; }
++    }
++    t->best[tid] = best;
++    t->best_val[tid] = best_val;
 +}
 +
  void nemo_linear_weight(float *y, const float *x, const nemo_weight_t *w, const float *b,
@@ -35,7 +141,7 @@ weight dispatcher in nemotron_asr_kernels.c, the f32 pointer in nemo_weight_t
      long long work = (long long)rows * (long long)in_dim * (long long)out_dim;
      nemo_linear_weight_task_t task = {y, x, w, b, rows, in_dim, out_dim};
      if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
-@@ -643,6 +661,13 @@ void nemo_linear3_nobias_weight(float *y0, float *y1, float *y2, const float *x,
+@@ -643,6 +764,13 @@ void nemo_linear3_nobias_weight(float *y0, float *y1, float *y2, const float *x,
                                  const nemo_weight_t *w0, const nemo_weight_t *w1,
                                  const nemo_weight_t *w2,
                                  int rows, int in_dim, int out_dim) {
@@ -49,53 +155,66 @@ weight dispatcher in nemotron_asr_kernels.c, the f32 pointer in nemo_weight_t
      long long work = (long long)rows * (long long)in_dim * (long long)out_dim * 3LL;
      nemo_linear3_weight_task_t task = {y0, y1, y2, x, w0, w1, w2, rows, in_dim, out_dim};
      if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
-@@ -681,6 +706,19 @@ void nemo_prompt_linear_relu_weight(float *y, const float *x, const nemo_weight_
+@@ -681,6 +809,17 @@ void nemo_prompt_linear_relu_weight(float *y, const float *x, const nemo_weight_
                                      const float *b, int rows, int in_dim,
                                      int prompt_dim, int prompt_id, int out_dim) {
      if (prompt_id < 0 || prompt_id >= prompt_dim) prompt_id = prompt_dim - 1;
 +    if (w->dtype == NEMO_TENSOR_F32) {
-+        int stride = in_dim + prompt_dim;
-+        for (int r = 0; r < rows; r++) {
-+            const float *xr = x + (size_t)r * in_dim;
-+            for (int o = 0; o < out_dim; o++) {
-+                const float *wr = w->f32 + (size_t)o * stride;
-+                float v = (b ? b[o] : 0.0f) + wr[in_dim + prompt_id];
-+                v += nemo_dot_f32(xr, wr, in_dim);
-+                y[(size_t)r * out_dim + o] = v > 0.0f ? v : 0.0f;
-+            }
++        nemo_f32_prompt_task_t task = {y, x, w->f32, b, rows, in_dim,
++                                       prompt_dim, prompt_id, out_dim};
++        long long work = (long long)rows * (long long)in_dim * (long long)out_dim;
++        if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
++            nemo_parallel_for(nemo_f32_prompt_worker, &task);
++        } else {
++            nemo_f32_prompt_worker(0, 1, &task);
 +        }
 +        return;
 +    }
      long long work = (long long)rows * (long long)in_dim * (long long)out_dim;
      nemo_prompt_q8_task_t task = {y, x, w, b, rows, in_dim, prompt_dim, prompt_id, out_dim};
      if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
-@@ -694,6 +732,15 @@ void nemo_lstm_gates_weight(float *y, const float *x, const float *h,
+@@ -694,6 +833,17 @@ void nemo_lstm_gates_weight(float *y, const float *x, const float *h,
                              const nemo_weight_t *w_ih, const nemo_weight_t *w_hh,
                              const float *b_ih, const float *b_hh,
                              int dim, int out_dim) {
 +    if (w_ih->dtype == NEMO_TENSOR_F32 || w_hh->dtype == NEMO_TENSOR_F32) {
-+        for (int o = 0; o < out_dim; o++) {
-+            float v = (b_ih ? b_ih[o] : 0.0f) + (b_hh ? b_hh[o] : 0.0f);
-+            v += nemo_dot_f32(x, w_ih->f32 + (size_t)o * dim, dim);
-+            v += nemo_dot_f32(h, w_hh->f32 + (size_t)o * dim, dim);
-+            y[o] = v;
++        nemo_f32_lstm_task_t task = {y, x, h, w_ih->f32, w_hh->f32,
++                                     b_ih, b_hh, dim, out_dim};
++        long long work = (long long)dim * (long long)out_dim * 2LL;
++        if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
++            nemo_parallel_for(nemo_f32_lstm_worker, &task);
++        } else {
++            nemo_f32_lstm_worker(0, 1, &task);
 +        }
 +        return;
 +    }
      long long work = (long long)dim * (long long)out_dim * 2LL;
      nemo_lstm_gates_q8_task_t task = {y, x, h, w_ih, w_hh, b_ih, b_hh, dim, out_dim};
      if (g_tp.n_threads > 1 && work >= NEMO_PARALLEL_WORK_MIN) {
-@@ -722,6 +769,17 @@ float nemo_attention_score_f32(const float *q, const float *bias_u, const float
+@@ -722,6 +872,30 @@ float nemo_attention_score_f32(const float *q, const float *bias_u, const float
  
  int nemo_argmax_matvec_weight(const float *x, const nemo_weight_t *w, const float *b,
                                int in_dim, int out_dim, float *best_val_out) {
 +    if (w->dtype == NEMO_TENSOR_F32) {
++        nemo_f32_argmax_task_t task;
++        memset(&task, 0, sizeof(task));
++        task.x = x; task.w = w->f32; task.b = b;
++        task.in_dim = in_dim; task.out_dim = out_dim;
++        int parallel = g_tp.n_threads > 1 &&
++                       (long long)in_dim * (long long)out_dim >= NEMO_PARALLEL_WORK_MIN;
++        if (parallel) {
++            nemo_parallel_for(nemo_f32_argmax_worker, &task);
++        } else {
++            nemo_f32_argmax_worker(0, 1, &task);
++        }
++        int n_threads = parallel ? g_tp.n_threads : 1;
 +        int best = 0;
 +        float best_val = -3.4028234663852886e38f;
-+        for (int o = 0; o < out_dim; o++) {
-+            float v = (b ? b[o] : 0.0f) +
-+                      nemo_dot_f32(x, w->f32 + (size_t)o * in_dim, in_dim);
-+            if (v > best_val) { best_val = v; best = o; }
++        for (int i = 0; i < n_threads; i++) {
++            if (task.best_val[i] > best_val) {
++                best_val = task.best_val[i];
++                best = task.best[i];
++            }
 +        }
 +        if (best_val_out) *best_val_out = best_val;
 +        return best;
