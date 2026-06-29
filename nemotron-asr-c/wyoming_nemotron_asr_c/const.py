@@ -27,14 +27,12 @@ QuantSpec = namedtuple("QuantSpec", ["label", "weight_bits", "activation", "impl
 
 QUANTS: dict[str, QuantSpec] = {
     "f32":  QuantSpec("Float32",          32, "f32",  True),
-    "bf16": QuantSpec("BFloat16",         16, "f32",  True),
     "q8p":  QuantSpec("Q8P (W8A8 packed)", 8, "int8", True),
 }
 
 # Converter flag per quant key (matches convert_nemo.py --*-linear-weights).
 QUANT_CONVERTER_FLAGS: dict[str, str | None] = {
     "f32":  None,                      # default (no flag)
-    "bf16": "--bf16-linear-weights",
     "q8p":  "--w8a8-linear-weights",
 }
 

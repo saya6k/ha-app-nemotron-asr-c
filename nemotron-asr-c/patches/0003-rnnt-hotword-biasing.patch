@@ -1,21 +1,16 @@
 RNN-T greedy decoder hotword (contextual) biasing.
 
-Vendored patch against kdrkdrkdr/nemotron-asr-streaming.c @ 4fde8b47
-(NEMOTRON_C_REF in the Dockerfile). Applied in the builder stage with `git
-apply` right after the shared-lib and set-att-right patches.
+Vendored patch, rebased onto kdrkdrkdr/nemotron-asr-streaming.c @ 568ef79
+(NEMOTRON_C_REF in the Dockerfile). Applied in the builder after the shared-lib
+and set-att-right patches.
 
-Adds `nemo_set_hotwords(ctx, ids, lens, n, boost)` to the public API.
-Hotword phrases (token-id sequences) are stored in nemo_ctx_t (global, set
-once at boot). During greedy decode, `boost` is added to the logit of any
-token that starts or continues a phrase, nudging the argmax toward known
-vocabulary. boost == 0 or n == 0 clears biasing. No-op when inactive.
-
-Active partial matches are tracked per-stream in nemo_rnnt_stream_t and
-persist across encoder frames (blank frames do not advance them).
-
+Adds nemo_set_hotwords(ctx, ids, lens, n, boost): boost is added to the logit of
+any token that starts or continues a known phrase during greedy decode. Partial
+matches are tracked per-stream and persist across encoder frames. boost==0 or
+n==0 clears biasing; no-op when inactive.
 --- nemotron_asr.c
 +++ nemotron_asr.c
-@@ -41,6 +41,11 @@ nemo_ctx_t *nemo_load(const char *model_path) {
+@@ -52,6 +52,11 @@ nemo_ctx_t *nemo_load(const char *model_path) {
      ctx->att_right = 3;
      ctx->strip_lang_tags = 0;
      ctx->max_symbols_per_step = 10;
@@ -27,7 +22,7 @@ persist across encoder frames (blank frames do not advance them).
      fprintf(stderr, "Loaded Nemotron 3.5 ASR model: %d tensors, vocab=%d\n",
              ctx->model.n_tensors, ctx->model.vocab_size);
      return ctx;
-@@ -48,6 +53,9 @@ nemo_ctx_t *nemo_load(const char *model_path) {
+@@ -59,6 +64,9 @@ nemo_ctx_t *nemo_load(const char *model_path) {
  
  void nemo_free(nemo_ctx_t *ctx) {
      if (!ctx) return;
@@ -37,7 +32,7 @@ persist across encoder frames (blank frames do not advance them).
      nemo_model_free(&ctx->model);
      free(ctx);
  }
-@@ -64,6 +72,37 @@ int nemo_set_language(nemo_ctx_t *ctx, const char *lang) {
+@@ -75,6 +83,37 @@ int nemo_set_language(nemo_ctx_t *ctx, const char *lang) {
      return -1;
  }
  
@@ -77,7 +72,7 @@ persist across encoder frames (blank frames do not advance them).
      if (att_right < 0) att_right = 0;
 --- nemotron_asr.h
 +++ nemotron_asr.h
-@@ -115,6 +115,12 @@ typedef struct {
+@@ -118,6 +118,12 @@ typedef struct {
      int strip_lang_tags;
      int max_symbols_per_step;
  
@@ -90,7 +85,7 @@ persist across encoder frames (blank frames do not advance them).
      double perf_audio_ms;
      double perf_mel_ms;
      double perf_encoder_ms;
-@@ -144,6 +150,8 @@ const nemo_tensor_t *nemo_model_find(const nemo_model_t *model, const char *name
+@@ -146,6 +152,8 @@ const nemo_tensor_t *nemo_model_find(const nemo_model_t *model, const char *name
  nemo_ctx_t *nemo_load(const char *model_path);
  void nemo_free(nemo_ctx_t *ctx);
  int nemo_set_language(nemo_ctx_t *ctx, const char *lang);
@@ -101,7 +96,7 @@ persist across encoder frames (blank frames do not advance them).
  char *nemo_transcribe(nemo_ctx_t *ctx, const char *wav_path);
 --- nemotron_asr_decoder.c
 +++ nemotron_asr_decoder.c
-@@ -19,6 +19,12 @@ struct nemo_rnnt_stream_t {
+@@ -25,6 +25,12 @@ struct nemo_rnnt_stream_t {
      float pred_out[NEMO_PRED_HIDDEN];
      float pred_proj[NEMO_JOINT_HIDDEN];
      strbuf_t text;
@@ -114,7 +109,7 @@ persist across encoder frames (blank frames do not advance them).
  };
  
  static int sb_reserve(strbuf_t *sb, size_t add) {
-@@ -114,12 +120,57 @@ static int joint_argmax(const nemo_ctx_t *ctx, const float *enc_proj, const floa
+@@ -120,12 +126,57 @@ static int joint_argmax(const nemo_ctx_t *ctx, const float *enc_proj, const floa
                                       NEMO_JOINT_HIDDEN, NEMO_VOCAB_WITH_BLANK, NULL);
  }
  
@@ -128,7 +123,7 @@ persist across encoder frames (blank frames do not advance them).
 +        hidden[i] = v > 0.0f ? v : 0.0f;
 +    }
 +
-+    /* Compute full logits via nemo_linear_weight (handles f32/bf16/q8p). */
++    /* Compute full logits via nemo_linear_weight (handles f32/q8p). */
 +    float *logits = s->hw_logits;
 +    nemo_linear_weight(logits, hidden, &j->out_w, j->out_b,
 +                       1, NEMO_JOINT_HIDDEN, NEMO_VOCAB_WITH_BLANK);
@@ -172,7 +167,7 @@ persist across encoder frames (blank frames do not advance them).
      free(s);
  }
  
-@@ -144,6 +195,13 @@ nemo_rnnt_stream_t *nemo_rnnt_stream_create(nemo_ctx_t *ctx) {
+@@ -150,6 +201,13 @@ nemo_rnnt_stream_t *nemo_rnnt_stream_create(nemo_ctx_t *ctx) {
          return NULL;
      }
      s->text.data[0] = 0;
@@ -186,7 +181,7 @@ persist across encoder frames (blank frames do not advance them).
      return s;
  }
  
-@@ -161,16 +219,73 @@ int nemo_rnnt_stream_accept(nemo_ctx_t *ctx, nemo_rnnt_stream_t *s,
+@@ -167,16 +225,73 @@ int nemo_rnnt_stream_accept(nemo_ctx_t *ctx, nemo_rnnt_stream_t *s,
      }
      float *enc_proj = s->enc_proj;
      nemo_linear_weight(enc_proj, enc, &j->enc_w, j->enc_b, enc_frames, NEMO_D_MODEL, NEMO_JOINT_HIDDEN);

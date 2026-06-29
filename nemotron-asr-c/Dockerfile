@@ -4,7 +4,7 @@
 ARG BUILD_FROM=ghcr.io/home-assistant/base-debian:trixie
 
 # Pin upstream nemotron-asr-streaming.c commit (branch w8a8). Bump to follow.
-ARG NEMOTRON_C_REF=4fde8b47cdc00c3544135c9d8f38c3f66a8431e6
+ARG NEMOTRON_C_REF=568ef79cebfffa4ebb8f2da9f182a0e769558704
 
 # Pin upstream fastenhancer.c.wasm commit (optional speech-enhancement filter).
 ARG FASTENHANCER_REF=e69c3bf56bbd0fda42b6c4a7edc11f38ab198758

@@ -86,10 +86,11 @@ rootfs/.../s6-rc.d/             nemotron-asr-c (longrun) + discovery (oneshot)
 | Key | Name | Weight bits | Activation | Notes |
 |---|---|---|---|---|
 | `f32` | Float32 | 32 | f32 | Bit-exact reference |
-| `bf16` | BFloat16 | 16 | f32 | Linear weights only |
 | `q8p` | Q8P (W8A8) | 8 | int8 | Packed per-row int8, default |
 
-Upstream ships: f32, bf16, q8p (W8A8 Q8P packed).
+Upstream (@ 568ef79) is W8A8 Q8P-only; it dropped the f32-dense and bf16 weight
+paths. The add-on re-adds the f32 reference path via `patches/0005-restore-f32-weights.patch`
+(generic, single-threaded). bf16 is not restored.
 
 ## Build (Dockerfile)
 

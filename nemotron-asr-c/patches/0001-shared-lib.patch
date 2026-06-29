@@ -1,26 +1,24 @@
 --- Makefile
 +++ Makefile
-@@ -13,12 +13,13 @@
- SRCS = main.c $(RUNTIME_SRCS)
+@@ -45,7 +45,7 @@ TARGET = nemotron_asr$(EXE)
+ SRCS = main.c nemotron_asr.c nemotron_asr_audio.c nemotron_asr_encoder.c nemotron_asr_decoder.c nemotron_asr_model.c nemotron_asr_kernels.c nemotron_asr_kernels_generic.c nemotron_asr_kernels_neon.c nemotron_asr_kernels_avx.c
  OBJS = $(SRCS:.c=.o)
- RUNTIME_OBJS = $(RUNTIME_SRCS:.c=.o)
-+SHARED_TARGET = libnemotron_asr.so
- MIC_OBJS = mic.o $(RUNTIME_OBJS)
- KERNEL_CHECK_OBJS = kernel_check.o nemotron_asr_kernels_generic.o nemotron_asr_kernels_neon.o nemotron_asr_kernels_avx.o
- KERNEL_BENCH_OBJS = kernel_bench.o nemotron_asr_kernels.o nemotron_asr_kernels_generic.o nemotron_asr_kernels_neon.o nemotron_asr_kernels_avx.o
- UNAME_S := $(shell uname -s)
-
--.PHONY: all clean debug generic blas mic check-kernels bench-kernels check-arch-syntax
-+.PHONY: all clean debug generic blas mic check-kernels bench-kernels check-arch-syntax shared
-
+ 
+-.PHONY: all clean debug generic
++.PHONY: all clean debug generic shared
+ 
  all: $(TARGET)
-
-@@ -75,3 +76,10 @@
-
+ 
+@@ -69,3 +69,14 @@ generic: clean $(TARGET)
+ 
  clean:
- 	rm -f $(OBJS) kernel_check.o kernel_bench.o mic.o $(KERNEL_BENCH_TARGET) $(KERNEL_CHECK_TARGET) $(MIC_TARGET) $(TARGET)
+ 	rm -f $(OBJS) $(TARGET)
 +
 +# ---- shared library (HA add-on) ----
++# Position-independent runtime objects (everything but the CLI main.o)
++# linked into libnemotron_asr.so; the Python add-on loads this at startup.
++SHARED_TARGET = libnemotron_asr.so
++RUNTIME_OBJS  = $(filter-out main.o,$(OBJS))
 +shared: CFLAGS += -fPIC
 +shared: $(SHARED_TARGET)
 +

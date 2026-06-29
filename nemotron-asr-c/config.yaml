@@ -25,7 +25,7 @@ options:
   log_level: info
 schema:
   model: str
-  quantization: list(f32|bf16|q8p)
+  quantization: list(f32|q8p)
   chunk_size: list(80ms|160ms|320ms|560ms|1120ms)
   hf_token: password?
   hotwords:
