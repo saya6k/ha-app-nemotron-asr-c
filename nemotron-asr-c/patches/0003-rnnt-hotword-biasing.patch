@@ -1,6 +1,6 @@
 RNN-T greedy decoder hotword (contextual) biasing.
 
-Vendored patch, rebased onto kdrkdrkdr/nemotron-asr-streaming.c @ 568ef79
+Vendored patch, rebased onto kdrkdrkdr/nemotron-asr-streaming.c @ 5cc2026
 (NEMOTRON_C_REF in the Dockerfile). Applied in the builder after the shared-lib
 and set-att-right patches.
 
@@ -8,6 +8,11 @@ Adds nemo_set_hotwords(ctx, ids, lens, n, boost): boost is added to the logit of
 any token that starts or continues a known phrase during greedy decode. Partial
 matches are tracked per-stream and persist across encoder frames. boost==0 or
 n==0 clears biasing; no-op when inactive.
+
+Interaction with upstream's code-switch recovery (stall reset): when the reset
+re-primes the prediction network, the in-flight partial matches are dropped
+(hw_active_len = 0) since they no longer match the decoder's conditioning.
+First-token boosting is unaffected.
 --- nemotron_asr.c
 +++ nemotron_asr.c
 @@ -52,6 +52,11 @@ nemo_ctx_t *nemo_load(const char *model_path) {
@@ -96,10 +101,10 @@ n==0 clears biasing; no-op when inactive.
  char *nemo_transcribe(nemo_ctx_t *ctx, const char *wav_path);
 --- nemotron_asr_decoder.c
 +++ nemotron_asr_decoder.c
-@@ -25,6 +25,12 @@ struct nemo_rnnt_stream_t {
-     float pred_out[NEMO_PRED_HIDDEN];
-     float pred_proj[NEMO_JOINT_HIDDEN];
-     strbuf_t text;
+@@ -42,6 +42,12 @@ struct nemo_rnnt_stream_t {
+                          * nemo_encoder_stream_request_reset (see the orchestration
+                          * in nemotron_asr.c). Kept on the stream, not the shared
+                          * ctx, so concurrent streams never cross-signal. */
 +    /* Hotword partial-match tracking (active across encoder frames). */
 +    struct { int phrase_idx; int matched_len; } *hw_active;
 +    int hw_active_cap;
@@ -109,7 +114,7 @@ n==0 clears biasing; no-op when inactive.
  };
  
  static int sb_reserve(strbuf_t *sb, size_t add) {
-@@ -120,12 +126,57 @@ static int joint_argmax(const nemo_ctx_t *ctx, const float *enc_proj, const floa
+@@ -141,12 +147,57 @@ static int joint_argmax(const nemo_ctx_t *ctx, const float *enc_proj, const floa
                                       NEMO_JOINT_HIDDEN, NEMO_VOCAB_WITH_BLANK, NULL);
  }
  
@@ -167,7 +172,7 @@ n==0 clears biasing; no-op when inactive.
      free(s);
  }
  
-@@ -150,6 +201,13 @@ nemo_rnnt_stream_t *nemo_rnnt_stream_create(nemo_ctx_t *ctx) {
+@@ -171,6 +222,13 @@ nemo_rnnt_stream_t *nemo_rnnt_stream_create(nemo_ctx_t *ctx) {
          return NULL;
      }
      s->text.data[0] = 0;
@@ -178,10 +183,10 @@ n==0 clears biasing; no-op when inactive.
 +        nemo_rnnt_stream_free(s);
 +        return NULL;
 +    }
-     return s;
- }
- 
-@@ -167,16 +225,73 @@ int nemo_rnnt_stream_accept(nemo_ctx_t *ctx, nemo_rnnt_stream_t *s,
+     /* Resolve the stall threshold once per stream (not a process-wide latch):
+      * NEMO_STALL_RESET_FRAMES by default, overridable per run via the
+      * NEMO_STALL_FRAMES env var (0 disables code-switch recovery). */
+@@ -211,6 +269,9 @@ int nemo_rnnt_stream_accept(nemo_ctx_t *ctx, nemo_rnnt_stream_t *s,
      }
      float *enc_proj = s->enc_proj;
      nemo_linear_weight(enc_proj, enc, &j->enc_w, j->enc_b, enc_frames, NEMO_D_MODEL, NEMO_JOINT_HIDDEN);
@@ -190,6 +195,16 @@ n==0 clears biasing; no-op when inactive.
 +
      for (int t = 0; t < enc_frames; t++) {
          int emitted = 0;
+         /*
+@@ -241,9 +302,19 @@ int nemo_rnnt_stream_accept(nemo_ctx_t *ctx, nemo_rnnt_stream_t *s,
+             nemo_linear_weight(s->pred_proj, s->pred_out, &j->pred_w, j->pred_b,
+                                1, NEMO_PRED_HIDDEN, NEMO_JOINT_HIDDEN);
+             s->enc_reset_req = 1;
++            /* The prediction network is back at its blank/start state, so any
++             * partial hotword match in flight no longer matches the decoder's
++             * conditioning. Drop them; first-token boosting still applies. */
++            s->hw_active_len = 0;
+         }
          while (emitted < ctx->max_symbols_per_step) {
 -            int tok = joint_argmax(ctx, enc_proj + (size_t)t * NEMO_JOINT_HIDDEN, s->pred_proj);
 +            int tok;
@@ -202,6 +217,7 @@ n==0 clears biasing; no-op when inactive.
              if (tok == NEMO_BLANK_ID) break;
              if (append_piece(ctx, &s->text, tok) != 0) return -1;
              ctx->perf_tokens++;
+@@ -251,6 +322,54 @@ int nemo_rnnt_stream_accept(nemo_ctx_t *ctx, nemo_rnnt_stream_t *s,
              if (pred_step(ctx, tok, s->h, s->c, s->pred_out) != 0) return -1;
              nemo_linear_weight(s->pred_proj, s->pred_out, &j->pred_w, j->pred_b,
                                 1, NEMO_PRED_HIDDEN, NEMO_JOINT_HIDDEN);
@@ -255,4 +271,4 @@ n==0 clears biasing; no-op when inactive.
 +
              emitted++;
          }
-     }
+         s->blank_run = emitted ? 0 : s->blank_run + 1;
