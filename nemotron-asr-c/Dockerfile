@@ -125,6 +125,12 @@ RUN pip3 install --no-cache-dir --no-compile --no-deps /usr/src/app
 FROM ${BUILD_FROM}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# The base image is labeled io.hass.type=base and build-image only stamps
+# io.hass.arch/version, so without this the add-on image inherits "base".
+# Supervisor's own value is "app" (META_ADDON = "addon" is marked legacy).
+LABEL io.hass.type="app"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
